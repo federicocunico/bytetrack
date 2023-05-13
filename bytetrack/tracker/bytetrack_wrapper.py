@@ -1,9 +1,11 @@
-#import argparse
+# import argparse
 import os
 import os.path as osp
+from typing import List
 import cv2
 import torch
 from .byte_tracker import BYTETracker
+from .tracker_output import TrackerOutput
 
 from ..yolox import get_detector
 from ..yolox.utils.preprocessing import preproc
@@ -17,15 +19,10 @@ except ImportError:
     print("[Warning] torch2trt not found. Skipping acceleration")
     pass
 
+
 # Predictor(model, exp, trt_file, decoder, args["device"], args["fp16"])
 class ByteTrackWrapper(object):
-    def __init__(
-        self,
-        model,
-        exp: YoloXTrackerConfig,
-        trt_file=None,
-        decoder=None
-    ):
+    def __init__(self, model, exp: YoloXTrackerConfig, trt_file=None, decoder=None, framerate: int = 30):
         self.model = model
         self.decoder = decoder
         self.exp = exp
@@ -38,7 +35,9 @@ class ByteTrackWrapper(object):
         if trt_file is not None:
             model_trt = TRTModule()
             model_trt.load_state_dict(torch.load(trt_file))
-            x = torch.ones((1, 3, exp.test_size[0], exp.test_size[1]), device=self.device)
+            x = torch.ones(
+                (1, 3, exp.test_size[0], exp.test_size[1]), device=self.device
+            )
             self.model(x)
             self.model = model_trt
 
@@ -47,9 +46,9 @@ class ByteTrackWrapper(object):
 
         ### tracker
 
-        self.tracker = BYTETracker(exp, frame_rate=30)
+        self.tracker = BYTETracker(exp, frame_rate=framerate)
 
-    def inference(self, img, batchsize:int=1):
+    def inference(self, img, batchsize: int = 1):
         # detector
         outputs, img_info = self._inference_model(img)
         if len(outputs) < 0:
@@ -63,8 +62,10 @@ class ByteTrackWrapper(object):
 
         # tracker
         # online_targets = self.tracker.update(outputs[0], [img_info['height'], img_info['width']], self.test_size)
-        online_targets = self.tracker.update(outputs, [img_info['height'], img_info['width']], self.test_size)
-        
+        online_targets = self.tracker.update(
+            outputs, [img_info["height"], img_info["width"]], self.test_size
+        )
+
         online_tlwhs = []
         online_ids = []
         online_scores = []
@@ -73,38 +74,54 @@ class ByteTrackWrapper(object):
             tlwh = t.tlwh
             tid = t.track_id
 
-            vertical = tlwh[2] / tlwh[3] > self.exp.aspect_ratio_thresh # 0 is x, 1 is y, 2 is width, 3 is length. tlwh is the bounding box
+            # vertical = tlwh[2] / tlwh[3] > self.exp.aspect_ratio_thresh # 0 is x, 1 is y, 2 is width, 3 is length. tlwh is the bounding box
             # if tlwh[2] * tlwh[3] > self.exp.min_box_area and not vertical:
             if tlwh[2] * tlwh[3] > self.exp.min_box_area:
                 online_tlwhs.append(tlwh)
                 online_ids.append(tid)
-                #print(tid, "\n")
+                # print(tid, "\n")
                 online_scores.append(t.score)
-                 
-        out = {
-            "tlws": online_tlwhs,
-            "ids": online_ids,
-            "scores": online_scores
-        }      
+
+        # out = {
+        #     "tlws": online_tlwhs,
+        #     "ids": online_ids,
+        #     "scores": online_scores
+        # }
 
         return online_tlwhs, online_ids, online_scores
-        
 
+    def forward(self, frame) -> List[TrackerOutput]:
+        online_tlwhs, online_ids, online_scores = self.inference(frame, 1)
+
+        res: List[TrackerOutput] = []
+        for i in range(len(online_ids)):
+            track_id = online_ids[i]
+            tlwh = online_tlwhs[i]
+            score = online_scores[i]
+            out = TrackerOutput(track_id=track_id, tlwh=tlwh, score=score)
+            res.append(out)
+        return res
 
     def _inference_model(self, img):
         img_info = {"id": 0}
         if isinstance(img, str):
-            img_info["file_name"] = osp.basename(img) # stampa ultima parte indirizzo (os.path.basename)
-            img = cv2.imread(img) # legge l'immagine -> dimensione 3 (altezza, larghezza, channels)
+            img_info["file_name"] = osp.basename(
+                img
+            )  # stampa ultima parte indirizzo (os.path.basename)
+            img = cv2.imread(
+                img
+            )  # legge l'immagine -> dimensione 3 (altezza, larghezza, channels)
         else:
             img_info["file_name"] = None
 
-        height, width = img.shape[:2] 
+        height, width = img.shape[:2]
         img_info["height"] = height
         img_info["width"] = width
         img_info["raw_img"] = img
 
-        img, ratio = preproc(img, self.test_size, self.rgb_means, self.std) # applica padding
+        img, ratio = preproc(
+            img, self.test_size, self.rgb_means, self.std
+        )  # applica padding
         img_info["ratio"] = ratio
         # from_numpy crea un tensore dall'immagine, unsqueeze aumenta la dimensione
         img = torch.from_numpy(img).unsqueeze(0).float().to(self.device)
@@ -112,7 +129,7 @@ class ByteTrackWrapper(object):
         if self.fp16:
             img = img.half()  # to FP16
 
-        with torch.no_grad(): # loop in cui i tensori hanno il calcolo del gradiente disabilitato
+        with torch.no_grad():  # loop in cui i tensori hanno il calcolo del gradiente disabilitato
             # timer.tic()
             outputs = self.model(img)
             if self.decoder is not None:
@@ -125,10 +142,10 @@ class ByteTrackWrapper(object):
         return outputs, img_info
 
 
-def get_bytetrack_tracker(parameters: YoloXTrackerConfig, checkpoint: str, fps_expected: int = 20):
-
-
-    if parameters.trt: # argomento per TensorRT model for testing
+def get_bytetrack_tracker(
+    parameters: YoloXTrackerConfig, checkpoint: str, fps_expected: int = 20
+):
+    if parameters.trt:  # argomento per TensorRT model for testing
         parameters.device = "cuda"
 
     device = parameters.get_torch_device()
@@ -138,7 +155,7 @@ def get_bytetrack_tracker(parameters: YoloXTrackerConfig, checkpoint: str, fps_e
         width=parameters.width,
         num_classes=parameters.num_classes,
     )
-    
+
     if parameters.trt == False:
         ckpt = torch.load(checkpoint, map_location="cpu")
         # load the model state dict
@@ -170,7 +187,6 @@ def get_bytetrack_tracker(parameters: YoloXTrackerConfig, checkpoint: str, fps_e
         decoder = None
 
     parameters.fps = fps_expected
-    predictor = ByteTrackWrapper(model, parameters, trt_file, decoder)
+    predictor = ByteTrackWrapper(model, parameters, trt_file, decoder, framerate=fps_expected)
 
     return predictor
-
